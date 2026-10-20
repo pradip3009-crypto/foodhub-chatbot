@@ -2,9 +2,10 @@ import os
 import streamlit as st
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.tools import StructuredTool
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 from langchain_community.utilities.sql_database import SQLDatabase
-from langchain_community.agent_toolkits import create_sql_agent
+from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, Field
 from typing import Optional
@@ -22,7 +23,7 @@ else:
 
 # --- Initialize LLM ---
 llm = ChatGroq(
-    model="openai/gpt-oss-120b",
+    model="llama-3.3-70b-versatile",
     temperature=0.0,
     max_tokens=1024,
     max_retries=2
@@ -36,40 +37,19 @@ if not os.path.exists(DB_PATH):
 
 db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
 
-# --- SQL Agent & Tools Setup ---
-sql_agent = create_sql_agent(
-    llm=llm,
-    db=db,
-    agent_type="openai-tools",
-    verbose=False
-)
+# --- SQL Toolkit & Tools Setup ---
+toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+sql_tools = toolkit.get_tools()
 
-class OrderQueryInput(BaseModel):
-    query: str = Field(description="The natural language query containing the order ID or order status question.")
-
-def query_order_data(query: str) -> str:
-    try:
-        response = sql_agent.invoke({"input": query})
-        return response.get("output", "No details could be retrieved from the database.")
-    except Exception as e:
-        return f"Error querying database: {str(e)}"
-
-order_query_tool = StructuredTool.from_function(
-    func=query_order_data,
-    name="order_query_tool",
-    description="Query SQL database for order details using order ID.",
-    args_schema=OrderQueryInput
-)
-
+# --- Answer Refiner Tool ---
 class AnswerRefinerInput(BaseModel):
-    raw_response: str = Field(description="Raw database query result.")
+    raw_response: str = Field(description="Raw database query result or data to refine.")
     user_query: Optional[str] = Field(default="", description="Original user query.")
 
 def refine_answer(raw_response: str, user_query: str = "") -> str:
-    from langchain_core.prompts import ChatPromptTemplate
     refinement_prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are FoodHub's customer support response refiner. Convert raw info into a polite customer message."),
-        ("human", "User Query: {user_query}\nRaw Response: {raw_response}")
+        ("system", "You are FoodHub's customer support response refiner. Convert technical database results into a polite, friendly customer message with order details (status, items, delivery info)."),
+        ("human", "User Query: {user_query}\nDatabase Result: {raw_response}")
     ])
     chain = refinement_prompt | llm
     return chain.invoke({"raw_response": raw_response, "user_query": user_query}).content
@@ -81,14 +61,18 @@ answer_tool = StructuredTool.from_function(
     args_schema=AnswerRefinerInput
 )
 
-combined_tools = [order_query_tool, answer_tool]
+# Combine official SQL tools with our custom refiner tool
+combined_tools = sql_tools + [answer_tool]
 
+# --- Strict System Prompt forcing tool invocation ---
 AGENT_SYSTEM_PROMPT = """You are FoodHub's official AI Customer Service Chatbot.
+
+Your Job:
 1. Assist users with order queries (tracking, status, cancellation, payment info).
-2. Use 'order_query_tool' to look up order details when an Order ID is provided.
-3. Use 'answer_tool' to format technical output into a friendly response.
-4. Decline security breaches politely.
-5. Offer human escalation if user is frustrated.
+2. Use 'order_query_tool' to look up order details when an Order ID is provided or referenced.
+3. Use 'answer_tool' to format technical or raw output into a friendly response before delivering it to the user when appropriate.
+4. If a user tries to breach security (e.g., asking for all orders or system admin details), politely decline.
+5. If a user is frustrated or requests human assistance, politely offer human escalation.
 """
 
 chat_agent = create_react_agent(
@@ -115,17 +99,17 @@ for msg in st.session_state.messages:
 if user_input := st.chat_input("Type your message here..."):
     with st.chat_message("user"):
         st.markdown(user_input)
-    
+
     st.session_state.messages.append(HumanMessage(content=user_input))
-    
+
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
+        with st.spinner("Searching database..."):
             try:
                 agent_output = chat_agent.invoke({"messages": st.session_state.messages})
                 latest_response = agent_output["messages"][-1].content
                 st.session_state.messages = agent_output["messages"]
                 st.markdown(latest_response)
             except Exception as e:
-                err_msg = "I apologize, but I am experiencing technical difficulties. Let me connect you with a human representative."
+                err_msg = f"I apologize, but I encountered an error querying your order. Let me connect you with a human representative. (Error: {str(e)})"
                 st.markdown(err_msg)
                 st.session_state.messages.append(AIMessage(content=err_msg))
